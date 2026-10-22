@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { pool } from "../db.js";
+import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = Router();
 
@@ -13,20 +14,22 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET;
 
 // Max 10 attempts per 15 minutes per IP: blocks brute-force guessing
-router.use(
-  rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 10,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    message: { error: "Too many attempts, please try again later" },
-  })
-);
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many attempts, please try again later" },
+});
 
 // Input rules
 const signupSchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(100),
-  email: z.string().trim().toLowerCase().email("Invalid email").max(255),
+  email: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .pipe(z.email("Invalid email").max(255)),
   password: z
     .string()
     .min(8, "Password must be at least 8 characters")
@@ -34,23 +37,28 @@ const signupSchema = z.object({
 });
 
 const loginSchema = z.object({
-  email: z.string().trim().toLowerCase().email("Invalid email"),
+  email: z.string().trim().toLowerCase().pipe(z.email("Invalid email")),
   password: z.string().min(1, "Password is required").max(72),
 });
+
+// Cookie settings, shared by login and logout
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax" as const,
+};
 
 // Create a token and store it in a secure cookie
 function setAuthCookie(res: Response, userId: string) {
   const token = jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: "7d" });
   res.cookie("token", token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    ...cookieOptions,
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
   });
 }
 
 // POST /api/auth/signup
-router.post("/signup", async (req, res) => {
+router.post("/signup", authLimiter, async (req, res) => {
   const parsed = signupSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message });
@@ -80,7 +88,7 @@ router.post("/signup", async (req, res) => {
 });
 
 // POST /api/auth/login
-router.post("/login", async (req, res) => {
+router.post("/login", authLimiter, async (req, res) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message });
@@ -106,8 +114,24 @@ router.post("/login", async (req, res) => {
 
 // POST /api/auth/logout
 router.post("/logout", (_req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", cookieOptions);
   res.json({ message: "Logged out" });
+});
+
+// GET /api/auth/me: returns the logged-in user
+router.get("/me", requireAuth, async (req, res) => {
+  const result = await pool.query(
+    "SELECT id, name, email FROM users WHERE id = $1",
+    [req.userId]
+  );
+  const user = result.rows[0];
+
+  if (!user) {
+    res.status(401).json({ error: "Not logged in" });
+    return;
+  }
+
+  res.json({ user });
 });
 
 export default router;
